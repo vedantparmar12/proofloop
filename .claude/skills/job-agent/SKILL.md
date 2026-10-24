@@ -5,7 +5,7 @@ description: Operate the local ProofLoop job application dashboard. Use when the
 
 # Job Agent
 
-Install dependencies with `bun install` and run `bun run cli` from the project root. The local service must be running at `http://127.0.0.1:3000`; start it with `bun run dev` if needed. Use `bun run test` for tests; the package scripts retain Node as the runtime.
+Use Bun for package management, runtime, and tests. Install dependencies with `bun install` and run `bun run cli` from the project root. The local service must be running at `http://127.0.0.1:3000`; start it with `bun run dev` if needed. Use `bun run test` to keep test files isolated from each other's database state.
 
 ## Commands
 
