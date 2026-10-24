@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#17253d">
+  <meta name="htmx-config" content='{"allowEval":false,"allowScriptTags":false,"historyCacheSize":0,"selfRequestsOnly":true}'>
+  <title>ProofLoop — Local career copilot</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%2317253d'/%3E%3Ctext x='10' y='23' fill='white' font-family='sans-serif' font-weight='bold' font-size='22'%3EP%3C/text%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/styles.css">
+  <script defer src="/vendor/htmx.min.js"></script>
+  <script defer src="/app.js"></script>
+</head>
+<body hx-history="false" hx-indicator="#request-status" hx-disabled-elt=".nav-item">
+  <header class="topbar">
+    <a class="brand" href="/" aria-label="ProofLoop home">
+      <span class="brand-mark">P</span>
+      <span>ProofLoop</span>
+    </a>
+    <div class="local-badge"><span></span> Local & private</div>
+  </header>
+
+  <div class="shell">
+    <aside class="sidebar">
+      <nav aria-label="Main navigation" hx-target="#dashboard" hx-swap="innerHTML">
+        <button type="button" class="nav-item active" data-view="jobs" hx-get="/views/jobs"><span>Jobs</span><span class="count" id="jobs-count">0</span></button>
+        <button type="button" class="nav-item" data-view="review" hx-get="/views/review"><span>Review</span><span class="count" id="review-count">0</span></button>
+        <button type="button" class="nav-item" data-view="applications" hx-get="/views/applications"><span>Applications</span><span class="count" id="applications-count">0</span></button>
+        <button type="button" class="nav-item" data-view="profile" hx-get="/views/profile"><span>Profile & sources</span></button>
+      </nav>
+      <div class="sidebar-note">
+        <strong>You stay in control.</strong>
+        <p>Nothing is marked submitted until you confirm the final application yourself.</p>
+      </div>
+    </aside>
+
+    <main id="dashboard" hx-get="/views/jobs" hx-trigger="load" hx-target="this" hx-swap="innerHTML">
+      <p>Loading dashboard…</p>
+      <noscript>Enable JavaScript to use the local dashboard.</noscript>
+    </main>
+  </div>
+
+  <div id="request-status" class="htmx-indicator" role="status">Working…</div>
+  <dialog id="job-dialog">
+    <button type="button" class="dialog-close" data-action="close-dialog" aria-label="Close">×</button>
+    <div id="job-detail"></div>
+  </dialog>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+</body>
+</html>

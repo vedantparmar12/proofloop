@@ -1,0 +1,66 @@
+const baseUrl = process.env.PROOFLOOP_URL || 'http://127.0.0.1:3000';
+const [command, argument] = process.argv.slice(2);
+
+try {
+  const result = await run(command, argument);
+  console.log(typeof result === 'string' ? result : JSON.stringify(result, null, 2));
+} catch (error) {
+  console.error(`Error: ${error.message}`);
+  process.exitCode = 1;
+}
+
+async function run(action, value) {
+  if (!action || action === 'status') {
+    const state = await request('/api/state');
+    return {
+      jobs: state.jobs.length,
+      matched: state.jobs.filter((job) => job.match_score >= state.profile.min_match && job.status === 'new').length,
+      drafts: state.applications.filter((application) => application.status === 'draft').length,
+      approved: state.applications.filter((application) => application.status === 'approved').length,
+      submitted: state.applications.filter((application) => application.status === 'submitted').length,
+    };
+  }
+  if (action === 'scan') return request('/api/scan', { method: 'POST' });
+  if (action === 'list') {
+    const state = await request('/api/state');
+    const jobs = state.jobs.filter((job) => job.status === 'new');
+    return {
+      showing: Math.min(30, jobs.length),
+      total: jobs.length,
+      jobs: jobs.slice(0, 30).map((job) => ({
+        id: job.id,
+        score: job.match_score,
+        company: job.company,
+        title: job.title,
+        location: job.location,
+        applicationId: job.application_id,
+      })),
+    };
+  }
+  if (action === 'prepare' && value) {
+    const application = await request(`/api/jobs/${Number(value)}/prepare`, { method: 'POST' });
+    return { applicationId: application.id, jobId: application.job_id, status: application.status };
+  }
+  if (action === 'approve' && value) {
+    const application = await request(`/api/applications/${Number(value)}/approve`, { method: 'POST' });
+    return { applicationId: application.id, status: application.status };
+  }
+  if (action === 'assist' && value) {
+    return request(`/api/applications/${Number(value)}/assist`, { method: 'POST' });
+  }
+  if (action === 'submitted' && value) {
+    const application = await request(`/api/applications/${Number(value)}/submit`, { method: 'POST' });
+    return { applicationId: application.id, status: application.status, submittedAt: application.submitted_at };
+  }
+  return `Usage:\n  bun run cli status\n  bun run cli scan\n  bun run cli list\n  bun run cli prepare <job-id>\n  bun run cli approve <application-id>\n  bun run cli assist <application-id>\n  bun run cli submitted <application-id>\n\nAssisted apply opens visible Chromium and never submits. Mark submitted only after confirming it in the job portal.`;
+}
+
+async function request(path, options = {}) {
+  const response = await fetch(`${baseUrl}${path}`, {
+    ...options,
+    headers: { 'content-type': 'application/json', ...options.headers },
+  });
+  const payload = await response.json();
+  if (!response.ok) throw new Error(payload.error || `Request failed with ${response.status}`);
+  return payload;
+}
