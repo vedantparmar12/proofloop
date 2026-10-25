@@ -1,3 +1,10 @@
+import { FOLLOW_UP_DAYS, OUTCOME_EVENT_LABELS, OUTCOME_LABELS, OUTCOME_STAGES, daysSince } from './outcomes.js';
+
+const ATS_STATUS_LABELS = { pass: 'Passed', warn: 'Warnings', fail: 'Needs attention' };
+const outcomeEventLabels = Object.fromEntries(
+  Object.entries(OUTCOME_EVENT_LABELS).map(([stage, label]) => [`outcome_${stage}`, label]),
+);
+
 export function renderView(view, state) {
   let content;
   switch (view) {
@@ -7,6 +14,7 @@ export function renderView(view, state) {
           <div><p class="eyebrow">OPPORTUNITY INBOX</p><h1>Good matches, not more noise.</h1><p>Ranked against your target roles and evidence in your CV.</p></div>
           <button type="button" class="button primary" data-action="scan" hx-post="/api/scan" hx-target="#dashboard" hx-swap="innerHTML" hx-sync="this:drop" hx-disabled-elt="this, .nav-item">Scan sources</button>
         </div>
+        ${renderSearch(state)}
         <div id="scan-results" class="scan-results" ${state.scanResults ? '' : 'hidden'}>${(state.scanResults || []).map((item) => `<p><strong>${escapeHtml(item.source)}</strong>: ${item.error ? escapeHtml(item.error) : `${escapeHtml(item.count)} openings found`}</p>`).join('')}</div>
         <form id="job-filters" class="toolbar" hx-get="/views/jobs/list" hx-target="#jobs-list" hx-swap="innerHTML" hx-trigger="input changed delay:250ms, change, submit" hx-sync="this:replace">
           <label class="search"><span class="sr-only">Search jobs</span><input name="q" id="job-search" type="search" placeholder="Search title or company…"></label>
@@ -24,9 +32,28 @@ export function renderView(view, state) {
     }
     case 'applications':
       content = `
-        <div class="page-heading"><div><p class="eyebrow">APPLICATION TRACKER</p><h1>From ready to submitted.</h1><p>Assisted apply uses installed Google Chrome to fill recognized application forms. Handle login, CAPTCHA, screening answers, and submission yourself; select Assisted apply again after navigating to the form.</p></div></div>
+        <div class="page-heading"><div><p class="eyebrow">APPLICATION TRACKER</p><h1>From ready to submitted.</h1><p>Assisted apply uses installed Google Chrome to fill recognized application forms. Handle login, CAPTCHA, screening answers, and submission yourself; select Assisted apply again after navigating to the form. Record any replies or interviews yourself.</p></div></div>
+        <div class="metrics-grid" aria-label="Application totals">
+          <div class="metric"><strong id="companies-applied">${state.metrics.companiesApplied}</strong><span>Companies applied to</span></div>
+          <div class="metric"><strong id="submitted-total">${state.metrics.submitted}</strong><span>Confirmed submissions</span></div>
+          <div class="metric"><strong id="approved-total">${state.metrics.approved}</strong><span>Approved, not submitted</span></div>
+          <div class="metric"><strong id="drafts-total">${state.metrics.drafts}</strong><span>Drafts to review</span></div>
+        </div>
+        <p class="tracking-note">Only submissions you confirm count as applied. Company names are grouped ignoring case and extra spaces, not aliases or subsidiaries.</p>
+        <div class="panel funnel-panel" aria-label="Outcome funnel">
+          <div class="panel-heading"><div><h2>Stage reach</h2><p>User-recorded outcomes only. Counts are cumulative, so an interview still counts after a later rejection.</p></div></div>
+          <div class="funnel-grid">
+            <div class="funnel-step"><strong id="funnel-applied">${state.metrics.submitted}</strong><span>Applied</span></div>
+            <div class="funnel-step"><strong id="funnel-interviews">${state.metrics.interviews}</strong><span>Interviewed</span></div>
+            <div class="funnel-step"><strong id="funnel-offers">${state.metrics.offers}</strong><span>Offered</span></div>
+            <div class="funnel-step"><strong id="funnel-hired">${state.metrics.hired}</strong><span>Hired</span></div>
+          </div>
+          <p class="funnel-note">${state.metrics.awaitingOutcome} awaiting an outcome · ${state.metrics.followUpDue} ready for a follow-up (${FOLLOW_UP_DAYS}+ days quiet) · ${state.metrics.closed} closed</p>
+          <p class="hint">Outcomes are saved locally. ProofLoop does not contact employers, send follow-ups or detect replies.</p>
+        </div>
         <div id="assist-result" class="scan-results" role="status"></div>
-        <div id="applications-list" class="applications-list">${state.applications.length ? state.applications.map(renderApplication).join('') : emptyState('No applications yet', 'Approved and submitted applications will appear here.')}</div>`;
+        <div id="applications-list" class="applications-list">${state.applications.length ? state.applications.map(renderApplication).join('') : emptyState('No applications yet', 'Approved and submitted applications will appear here.')}</div>
+        <div class="panel activity-panel"><div class="panel-heading"><div><h2>Application activity</h2><p>Newest first · saved locally · times in UTC</p></div></div><div id="activity-list">${renderActivity(state.activity)}</div></div>`;
       break;
     case 'profile':
       content = renderProfile(state);
@@ -35,6 +62,31 @@ export function renderView(view, state) {
       throw new Error('Unknown view');
   }
   return `<section id="view-${escapeHtml(view)}" class="view active" data-view="${escapeHtml(view)}">${content}</section>`;
+}
+
+function renderSearch(state) {
+  const search = state.search || {
+    site: 'indeed', searchTerm: state.profile.target_roles.split(',')[0].trim(),
+    location: state.profile.target_locations.split(',')[0].trim(), country: 'india', resultsWanted: 15, hoursOld: 168,
+  };
+  const result = state.searchResult;
+  return `<details class="panel discovery-panel" ${result ? 'open' : ''}>
+    <summary>Search job boards with JobSpy <span class="hint">LinkedIn + Indeed</span></summary>
+    <p>Search by role and location, without company board slugs. Only these search settings go to the provider—not your CV or contact details. Use only where permitted; blocked searches are not bypassed.</p>
+    <form id="jobspy-search" class="discovery-form" hx-post="/api/search" hx-target="#dashboard" hx-swap="innerHTML" hx-sync="this:drop" hx-disabled-elt="#jobspy-search button, #jobspy-search input, #jobspy-search select, .nav-item, [data-action=scan]">
+      <div class="form-grid">
+        <label>Job board<select name="site">${[['indeed', 'Indeed'], ['linkedin', 'LinkedIn']].map(([value, label]) => `<option value="${value}" ${search.site === value ? 'selected' : ''}>${label}</option>`).join('')}</select></label>
+        <label>Role or keywords<input name="searchTerm" required minlength="2" maxlength="200" value="${escapeHtml(search.searchTerm)}" placeholder="Backend Engineer"></label>
+        <label>Search location<input name="location" required minlength="2" maxlength="160" value="${escapeHtml(search.location)}" placeholder="Bengaluru"></label>
+        <label>Country (Indeed)<select name="country">${[['india', 'India'], ['usa', 'United States'], ['uk', 'United Kingdom'], ['canada', 'Canada'], ['australia', 'Australia'], ['germany', 'Germany'], ['france', 'France']].map(([value, label]) => `<option value="${value}" ${search.country === value ? 'selected' : ''}>${label}</option>`).join('')}</select></label>
+        <label>Maximum results<input name="resultsWanted" type="number" required min="1" max="25" value="${escapeHtml(search.resultsWanted)}"></label>
+        <label>Posted within (hours)<input name="hoursOld" type="number" required min="1" max="720" value="${escapeHtml(search.hoursOld)}"></label>
+      </div>
+      <button type="submit" class="button secondary">Search JobSpy</button>
+    </form>
+    <p class="hint">Optional setup: <code>bun run setup:jobspy</code> (Python 3.10+). One search at a time, up to 25 results, 90-second timeout, 60-second cooldown. No automatic retries. Provider filters and availability vary.</p>
+    ${result ? `<div id="jobspy-result" class="scan-results" role="status"><p><strong>${escapeHtml(result.source)}</strong>: ${escapeHtml(result.count)} usable openings returned. Repeated provider IDs update existing jobs.${result.skipped ? ` ${escapeHtml(result.skipped)} invalid records skipped.` : ''}</p>${result.errors.map((message) => `<p class="search-error">Provider error: ${escapeHtml(message)} Results may be incomplete; try later or use company boards.</p>`).join('')}${result.warnings.map((message) => `<p>Warning: ${escapeHtml(message)}</p>`).join('')}${!result.count && !result.errors.length ? '<p>No openings returned. Try different keywords or a different location after the cooldown.</p>' : ''}</div>` : ''}
+  </details>`;
 }
 
 export function renderJobs(state, query = {}) {
@@ -63,7 +115,7 @@ export function renderJobs(state, query = {}) {
         <div class="job-actions">
           ${job.application_id
             ? `<button type="button" class="button ghost small" data-action="${review ? 'open-review' : 'open-applications'}" hx-get="/views/${review ? 'review' : 'applications'}" hx-target="#dashboard" hx-swap="innerHTML">${review ? 'Review draft' : 'View application'}</button>`
-            : `<button type="button" class="button ghost small" data-action="prepare" data-id="${id}" hx-post="${endpoint}/prepare" hx-target="#dashboard" hx-swap="innerHTML" hx-sync="this:drop" hx-disabled-elt="this, .nav-item">Prepare</button>`}
+            : `<button type="button" class="button ghost small" ${job.description.trim() ? '' : 'disabled title="Job description unavailable; view the original posting"'} data-action="prepare" data-id="${id}" hx-post="${endpoint}/prepare" hx-target="#dashboard" hx-swap="innerHTML" hx-sync="this:drop" hx-disabled-elt="this, .nav-item">Prepare</button>`}
           <button type="button" class="button secondary small" data-action="view-job" data-id="${id}" hx-get="/views/jobs/${urlId(job.id)}" hx-target="#job-detail" hx-swap="innerHTML">View</button>
           ${job.application_id ? '' : job.status === 'new'
             ? `<button type="button" class="icon-button" title="Skip job" data-action="skip" data-id="${id}" hx-post="${endpoint}/skip" hx-target="#jobs-list" hx-swap="innerHTML" hx-include="#job-filters">Skip</button>`
@@ -90,6 +142,7 @@ export function renderDraft(application) {
         <label>Recruiter message<textarea name="recruiterMessage" rows="4" required minlength="20" maxlength="4000">${escapeHtml(application.recruiter_message)}</textarea></label>
         <label>Cover letter<textarea name="coverLetter" rows="9" required minlength="100" maxlength="12000">${escapeHtml(application.cover_letter)}</textarea></label>
       </div>
+      ${renderAtsCheck(application.ats_check)}
       <div class="review-actions"><a class="text-link" href="${endpoint}/pdf">Download ATS PDF</a><div><button type="submit" class="button ghost" data-action="save-draft" data-id="${id}">Save edits</button><button type="button" class="button primary" data-action="approve" data-id="${id}" hx-post="${endpoint}/approve" hx-include="closest form" hx-target="#dashboard" hx-swap="innerHTML" hx-validate="true" hx-confirm="Approve this reviewed application?">Approve application</button></div></div>
     </form>`;
 }
@@ -99,8 +152,8 @@ export function renderJob(job) {
     <p class="eyebrow">${escapeHtml(job.company)} · ${escapeHtml(job.match_score)}% heuristic match</p>
     <h2>${escapeHtml(job.title)}</h2>
     <p>${escapeHtml(job.location)}</p>
-    <div class="job-description">${escapeHtml(job.description)}</div>
-    <div class="detail-actions"><a class="button ghost" href="${safeUrl(job.url)}" target="_blank" rel="noopener noreferrer">Original posting</a>${job.application_id ? '' : `<button type="button" class="button primary" data-action="prepare" data-id="${escapeHtml(job.id)}" hx-post="/api/jobs/${urlId(job.id)}/prepare" hx-target="#dashboard" hx-swap="innerHTML" hx-sync="this:drop" hx-disabled-elt="this, .nav-item">Prepare application</button>`}</div>`;
+    <div class="job-description">${escapeHtml(job.description || 'Description unavailable. Review the original posting manually; a draft cannot be prepared.')}</div>
+    <div class="detail-actions"><a class="button ghost" href="${safeUrl(job.url)}" target="_blank" rel="noopener noreferrer">Original posting</a>${job.application_id || !job.description.trim() ? '' : `<button type="button" class="button primary" data-action="prepare" data-id="${escapeHtml(job.id)}" hx-post="/api/jobs/${urlId(job.id)}/prepare" hx-target="#dashboard" hx-swap="innerHTML" hx-sync="this:drop" hx-disabled-elt="this, .nav-item">Prepare application</button>`}</div>`;
 }
 
 export function renderCvText(text) {
@@ -131,19 +184,85 @@ export function renderCounts(state) {
     <span class="count" id="applications-count" hx-swap-oob="outerHTML">${state.applications.length}</span>`;
 }
 
+export function renderActivity({ events, nextBefore }) {
+  const labels = {
+    baseline: 'Existing record', draft_created: 'Draft created', draft_updated: 'Draft edited',
+    approved: 'Application approved', submitted: 'Submission confirmed by you',
+    assist_opened: 'Browser assistance opened', assist_paused: 'Browser assistance paused', assist_failed: 'Browser assistance failed',
+    ...outcomeEventLabels,
+  };
+  return (events.length ? events.map((event) => `<div class="activity-item">
+    <div><strong>${escapeHtml(labels[event.kind])}</strong><span class="hint">Application #${escapeHtml(event.application_id)}</span></div>
+    <p>${escapeHtml(event.company)} · ${escapeHtml(event.title)}</p>
+    ${event.detail ? `<p>${escapeHtml(event.detail)}</p>` : ''}
+    <time datetime="${escapeHtml(event.occurred_at)}">${escapeHtml(event.occurred_at)}</time>
+  </div>`).join('') : '<p>No application activity yet.</p>')
+    + (nextBefore ? `<button type="button" class="button ghost" hx-get="/api/activity?before=${urlId(nextBefore)}" hx-target="this" hx-swap="outerHTML" hx-sync="this:drop" hx-disabled-elt="this">Load older activity</button>` : '');
+}
+
 function renderApplication(application) {
   const id = escapeHtml(application.id);
   const endpoint = `/api/applications/${urlId(application.id)}`;
+  const ats = parseAtsCheck(application.ats_check);
   return `
-    <article class="application-card">
-      <div><span class="status ${escapeHtml(application.status)}">${escapeHtml(application.status)}</span><h3>${escapeHtml(application.title)}</h3><p>${escapeHtml(application.company)} · ${escapeHtml(application.location)}</p></div>
+    <article class="application-card" id="application-${id}">
+      <div class="application-summary">
+        <div class="status-row"><span class="status ${escapeHtml(application.status)}">${escapeHtml(application.status)}</span>${ats ? `<span class="ats-chip ats-${ats.status}">ATS: ${ATS_STATUS_LABELS[ats.status]}</span>` : ''}</div>
+        <h3>${escapeHtml(application.title)}</h3><p>${escapeHtml(application.company)} · ${escapeHtml(application.location)}</p>${application.submitted_at ? `<p class="submitted-date">Confirmed <time datetime="${escapeHtml(application.submitted_at)}">${escapeHtml(application.submitted_at)}</time> (UTC)</p>` : ''}
+      </div>
       <div class="application-actions">
         <a class="text-link" href="${endpoint}/pdf">CV PDF</a>
         <a class="button ghost small" href="${safeUrl(application.url)}" target="_blank" rel="noopener noreferrer">Open job</a>
         ${application.status === 'approved' ? `<button type="button" class="button secondary small" data-action="assist" data-id="${id}" hx-post="${endpoint}/assist" hx-target="#assist-result" hx-swap="innerHTML" hx-sync="this:drop" hx-disabled-elt="this, .nav-item" hx-confirm="Open or reuse this application’s Chrome tab and fill its current form? This shares your contact details, approved cover letter and CV with the portal; attachments may upload immediately. Continue only where automated prefill is permitted.">Assisted apply</button><button type="button" class="button primary small" data-action="submitted" data-id="${id}" hx-post="${endpoint}/submit" hx-target="#dashboard" hx-swap="innerHTML" hx-confirm="Did you complete and verify the final submission in the job portal?">Confirm submitted</button>` : ''}
         ${application.status === 'draft' ? '<button type="button" class="button secondary small" data-action="open-review" hx-get="/views/review" hx-target="#dashboard" hx-swap="innerHTML">Review</button>' : ''}
       </div>
+      ${application.status === 'submitted' ? renderOutcome(application) : ''}
     </article>`;
+}
+
+function renderOutcome(application) {
+  const stage = OUTCOME_STAGES.includes(application.outcome) ? application.outcome : null;
+  const endpoint = `/api/applications/${urlId(application.id)}/outcome`;
+  const days = daysSince(application.submitted_at);
+  const quiet = !stage && days !== null && days >= FOLLOW_UP_DAYS;
+  return `<div class="application-extra">
+    <div class="outcome-summary">
+      ${stage
+        ? `<span class="outcome-badge ${escapeHtml(stage)}">${escapeHtml(OUTCOME_LABELS[stage])}</span><span class="outcome-date">Recorded <time datetime="${escapeHtml(application.outcome_at)}">${escapeHtml(application.outcome_at)}</time> (UTC)</span>${application.outcome_detail ? `<p class="outcome-detail">${escapeHtml(application.outcome_detail)}</p>` : ''}`
+        : '<span class="status">Awaiting outcome</span>'}
+      ${quiet ? `<span class="follow-up-due">No outcome recorded ${escapeHtml(days)} days after submission. Follow up with the employer yourself.</span>` : ''}
+    </div>
+    <details class="outcome-editor">
+      <summary>${stage ? 'Update outcome' : 'Record outcome'}</summary>
+      <form class="outcome-form" hx-post="${endpoint}" hx-target="#dashboard" hx-swap="innerHTML" hx-sync="this:drop" hx-disabled-elt="this button, .nav-item">
+        <select name="outcome" required aria-label="Outcome">${OUTCOME_STAGES.map((value) => `<option value="${value}" ${stage === value ? 'selected' : ''}>${escapeHtml(OUTCOME_LABELS[value])}</option>`).join('')}</select>
+        <input name="detail" maxlength="500" placeholder="Optional private note">
+        <button type="submit" class="button ghost small">Save outcome</button>
+      </form>
+      <p class="hint">Saved locally. Recording an outcome does not contact the employer, change the confirmed submission or edit your application.</p>
+    </details>
+  </div>`;
+}
+
+function parseAtsCheck(stored) {
+  try {
+    const check = typeof stored === 'string' && stored ? JSON.parse(stored) : null;
+    return check && ATS_STATUS_LABELS[check.status] && Array.isArray(check.checks) ? check : null;
+  } catch {
+    return null;
+  }
+}
+
+function renderAtsCheck(stored) {
+  const check = parseAtsCheck(stored);
+  if (!check) {
+    return '<div class="ats-panel ats-pending"><div class="ats-heading"><strong>ATS parse check</strong><span class="ats-status">Not run</span></div><p>Save edits or approve to run a mechanical text-layer check on this PDF.</p></div>';
+  }
+  return `<div class="ats-panel ats-${check.status}">
+    <div class="ats-heading"><strong>ATS parse check</strong><span class="ats-status ats-${check.status}">${ATS_STATUS_LABELS[check.status]}</span></div>
+    <p>${escapeHtml(Number(check.characters) || 0)} characters across ${escapeHtml(Number(check.pages) || 0)} page(s). Mechanical check only; not an ATS guarantee.</p>
+    <ul class="ats-checks">${check.checks.map((item) => `<li class="ats-${['pass', 'warn', 'fail'].includes(item.status) ? item.status : 'warn'}"><strong>${escapeHtml(item.label)}</strong><span>${escapeHtml(item.detail)}</span></li>`).join('')}</ul>
+  </div>`;
 }
 
 function renderProfile(state) {

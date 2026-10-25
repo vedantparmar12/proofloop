@@ -17,7 +17,7 @@ let browser;
 let child;
 let baseUrl;
 const draft = {
-  tailoredCv: '# Test Candidate\n\nBackend Engineer building reliable Node.js software and PostgreSQL services.\n\n## Experience\n- Built and tested accessible web applications.',
+  tailoredCv: '# Test Candidate\n\ncandidate@example.com · London\n\nBackend Engineer building reliable Node.js software and PostgreSQL services.\n\n## Experience\n- Built and tested accessible web applications.',
   recruiterMessage: 'Hello hiring team, my experience building Node.js services fits this engineering opportunity.',
   coverLetter: 'I am interested in this engineering role. My experience includes building reliable Node.js systems and accessible web applications, as described in my CV.',
 };
@@ -65,6 +65,19 @@ test('HTMX dashboard preserves edits, API behavior and explicit approval through
   } else {
     await writeFile(path.join(bin, 'gemini'), `#!/bin/sh\nexec "${process.execPath}" "${fakeGemini}"\n`, { mode: 0o755 });
   }
+  const fakeWorker = path.join(bin, 'jobspy.cjs');
+  await writeFile(fakeWorker, `let input=''; process.stdin.on('data',chunk=>input+=chunk); process.stdin.on('end',()=>{
+    const settings=JSON.parse(input);
+    if (Object.keys(settings).some(key=>!['site','searchTerm','location','country','resultsWanted','hoursOld'].includes(key))) process.exit(2);
+    console.log(JSON.stringify({jobs:[
+      {id:'test-1',site:settings.site,title:'Platform Engineer',company:'Discovery Company',location:settings.location,job_url:'https://example.test/jobs/discovery-1',description:'Build reliable PostgreSQL services.'},
+      {id:'test-2',site:settings.site,title:'No description role',company:'Discovery Company',location:settings.location,job_url:'https://example.test/jobs/discovery-2',description:null}
+    ],errors:{[settings.site]:'Some listings were blocked'},warnings:{[settings.site]:['Partial fixture results']}}));
+  });`);
+  const jobspyExecutable = path.join(bin, process.platform === 'win32' ? 'jobspy.cmd' : 'jobspy');
+  await writeFile(jobspyExecutable, process.platform === 'win32'
+    ? `@"${process.execPath}" "${fakeWorker}"\r\n`
+    : `#!/bin/sh\nexec "${process.execPath}" "${fakeWorker}"\n`, { mode: 0o755 });
   const jobs = ['Backend Engineer', 'Sales Manager'].map((title, index) => ({
     id: index + 1, title, location: { name: 'London' },
     absolute_url: `${portalUrl}/${index ? 'login' : 'apply'}`,
@@ -84,7 +97,7 @@ test('HTMX dashboard preserves edits, API behavior and explicit approval through
       }
     });`;
   child = spawn(process.execPath, ['--input-type=module', '-e', bootstrap], {
-    env: { ...process.env, DATA_DIRECTORY: directory, PORT: '0', PATH: `${bin}${path.delimiter}${process.env.PATH}` },
+    env: { ...process.env, DATA_DIRECTORY: directory, PORT: '0', JOBSPY_PYTHON: jobspyExecutable, PATH: `${bin}${path.delimiter}${process.env.PATH}` },
     stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
   });
   baseUrl = await new Promise((resolve, reject) => {
@@ -162,6 +175,8 @@ test('HTMX dashboard preserves edits, API behavior and explicit approval through
   await page.locator('#job-dialog[open]').waitFor();
   await requestFrom(page, '/api/jobs/1/prepare', () => page.locator('#job-dialog [data-action=prepare]').click(), 201);
   await page.locator('#application-1').waitFor();
+  await page.locator('#application-1 .ats-panel').getByText('Passed', { exact: true }).waitFor();
+  assert.match(await page.locator('#application-1 .ats-panel').innerText(), /Profile email is present as text/);
   assert.equal(await page.locator('#job-dialog').evaluate((element) => element.open), false);
   assert.equal(await page.locator('#review-count').innerText(), '1');
   await page.locator('[data-view=jobs].nav-item').click();
@@ -189,6 +204,8 @@ test('HTMX dashboard preserves edits, API behavior and explicit approval through
   assert.equal((await state()).applications.find((item) => item.id === 2).tailored_cv, draft.tailoredCv);
   const pdf = await fetch(`${baseUrl}/api/applications/1/pdf`);
   assert.equal(Buffer.from(await pdf.arrayBuffer()).subarray(0, 4).toString(), '%PDF');
+  await page.locator('#application-1 .ats-chip').waitFor();
+  assert.equal(await page.locator('#application-1 .ats-chip').textContent(), 'ATS: Passed');
 
   page.once('dialog', (dialog) => dialog.dismiss());
   await page.locator('[data-action=assist][data-id="1"]').click();
@@ -202,6 +219,8 @@ test('HTMX dashboard preserves edits, API behavior and explicit approval through
   assert.equal(snapshot.salary, '');
   await page.locator('#assist-result').getByText(/CV attached/).waitFor();
   assert.equal((await state()).applications.find((item) => item.id === 1).status, 'approved');
+  assert.equal((await state()).metrics.companiesApplied, 0);
+  await page.locator('#activity-list').getByText('Browser assistance opened', { exact: true }).waitFor();
   const approved = await fetch(`${baseUrl}/api/applications/2/approve`, { method: 'POST' });
   assert.equal((await approved.json()).status, 'approved');
   await page.locator('[data-view=applications].nav-item').click();
@@ -209,6 +228,11 @@ test('HTMX dashboard preserves edits, API behavior and explicit approval through
   page.once('dialog', (dialog) => dialog.accept());
   await requestFrom(page, '/api/applications/2/assist', () => page.locator('[data-action=assist][data-id="2"]').click());
   await page.getByText('Paused. Handle login or CAPTCHA yourself, then select Assisted apply again.', { exact: true }).waitFor();
+  const earlyOutcome = await fetch(`${baseUrl}/api/applications/1/outcome`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ outcome: 'interview' }),
+  });
+  assert.equal(earlyOutcome.status, 409);
+  assert.equal((await state()).applications.find((item) => item.id === 1).outcome, null);
   page.once('dialog', (dialog) => dialog.dismiss());
   await page.locator('[data-action=submitted][data-id="1"]').click();
   assert.equal((await state()).applications.find((item) => item.id === 1).status, 'approved');
@@ -217,6 +241,44 @@ test('HTMX dashboard preserves edits, API behavior and explicit approval through
   await page.locator('.status.submitted').waitFor();
   assert.equal(portalSubmissions, 0);
   assert.equal((await state()).applications.find((item) => item.id === 1).status, 'submitted');
+  assert.equal(await page.locator('#companies-applied').innerText(), '1');
+  assert.equal(await page.locator('#submitted-total').innerText(), '1');
+  assert.equal(await page.locator('.submitted-date').count(), 1);
+  const submittedAt = (await state()).applications.find((item) => item.id === 1).submitted_at;
+  assert.equal((await fetch(`${baseUrl}/api/applications/1/submit`, { method: 'POST' })).status, 409);
+  assert.equal((await state()).applications.find((item) => item.id === 1).submitted_at, submittedAt);
+  page.once('dialog', (dialog) => dialog.accept());
+  await requestFrom(page, '/api/applications/2/submit', () => page.locator('[data-action=submitted][data-id="2"]').click());
+  await page.waitForFunction(() => document.querySelector('#submitted-total').textContent === '2');
+  assert.equal(await page.locator('#companies-applied').innerText(), '1');
+  const activity = await (await fetch(`${baseUrl}/api/activity`)).json();
+  assert.equal(activity.events.filter((item) => item.kind === 'submitted').length, 2);
+  assert(activity.events.some((item) => item.kind === 'assist_paused'));
+  assert.equal((await fetch(`${baseUrl}/api/activity?before=invalid`)).status, 400);
+  assert.equal(portalSubmissions, 0);
+  assert.equal(await page.locator('#funnel-applied').innerText(), '2');
+  assert.equal(await page.locator('#funnel-interviews').innerText(), '0');
+  const invalidOutcome = await fetch(`${baseUrl}/api/applications/1/outcome`, {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ outcome: 'unknown' }),
+  });
+  assert.equal(invalidOutcome.status, 400);
+  await page.locator('#application-1 .outcome-editor summary').click();
+  await page.locator('#application-1 [name=outcome]').selectOption('interview');
+  await page.locator('#application-1 [name=detail]').fill('Recruiter screen scheduled');
+  await requestFrom(page, '/api/applications/1/outcome', () => page.locator('#application-1 .outcome-form button').click(), 201);
+  await page.waitForFunction(() => document.querySelector('#funnel-interviews')?.textContent === '1');
+  assert.equal(await page.locator('#application-1 .outcome-badge').textContent(), 'Interview');
+  assert.match(await page.locator('#application-1 .outcome-detail').innerText(), /Recruiter screen scheduled/);
+  assert.match(await page.locator('#activity-list').innerText(), /Interview recorded/);
+  const recorded = (await state()).applications.find((item) => item.id === 1);
+  assert.equal(recorded.outcome, 'interview');
+  assert.equal(recorded.outcome_detail, 'Recruiter screen scheduled');
+  const outcomeMetrics = (await state()).metrics;
+  assert.equal(outcomeMetrics.interviews, 1);
+  assert.equal(outcomeMetrics.offers, 0);
+  assert.equal(outcomeMetrics.awaitingOutcome, 1);
+  assert.equal(outcomeMetrics.followUpDue, 0);
+  assert.equal(portalSubmissions, 0);
   if (process.env.PROOFLOOP_SCREENSHOT_DIRECTORY) {
     await page.locator('#toast:not(.show)').waitFor({ state: 'attached' });
     await page.screenshot({ path: path.join(process.env.PROOFLOOP_SCREENSHOT_DIRECTORY, 'desktop.png'), fullPage: true, animations: 'disabled' });
@@ -224,6 +286,38 @@ test('HTMX dashboard preserves edits, API behavior and explicit approval through
   await page.setViewportSize({ width: 390, height: 844 });
   assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
   if (process.env.PROOFLOOP_SCREENSHOT_DIRECTORY) await page.screenshot({ path: path.join(process.env.PROOFLOOP_SCREENSHOT_DIRECTORY, 'mobile.png'), fullPage: true, animations: 'disabled' });
+  await page.locator('[data-view=jobs].nav-item').click();
+  await page.locator('.discovery-panel summary').click();
+  const searchForm = page.locator('#jobspy-search');
+  await searchForm.locator('[name=site]').selectOption('linkedin');
+  await searchForm.locator('[name=searchTerm]').fill('Platform Engineer');
+  await searchForm.locator('[name=location]').fill('Bengaluru');
+  await requestFrom(page, '/api/search', () => searchForm.locator('button').click());
+  await page.locator('#jobspy-result').getByText(/Some listings were blocked/).waitFor();
+  assert.match(await page.locator('#jobspy-result').innerText(), /2 usable openings returned/);
+  assert.match(await page.locator('#jobspy-result').innerText(), /Partial fixture results/);
+  assert.equal(await page.locator('#jobspy-search [name=searchTerm]').inputValue(), 'Platform Engineer');
+  const discovered = (await state()).jobs.filter((item) => item.source === 'jobspy:linkedin');
+  assert.equal(discovered.length, 2);
+  assert.equal((await state()).metrics.companiesApplied, 1);
+  const noDescription = discovered.find((item) => !item.description);
+  assert.equal(await page.locator(`[data-action=prepare][data-id="${noDescription.id}"]`).isDisabled(), true);
+  assert.equal((await fetch(`${baseUrl}/api/jobs/${noDescription.id}/prepare`, { method: 'POST' })).status, 400);
+  await requestFrom(page, '/api/search', () => page.locator('#jobspy-search button').click(), 429);
+  await page.getByText('JobSpy search is busy or cooling down. Wait at least 60 seconds between searches.', { exact: true }).waitFor();
+  assert.equal(await page.locator('#jobspy-search [name=searchTerm]').inputValue(), 'Platform Engineer');
+  const invalidSearch = await fetch(`${baseUrl}/api/search`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ site: 'naukri', searchTerm: 'Engineer', location: 'Pune' }),
+  });
+  assert.equal(invalidSearch.status, 400);
+  assert(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth));
+  if (process.env.PROOFLOOP_SCREENSHOT_DIRECTORY) {
+    await page.locator('#toast:not(.show)').waitFor({ state: 'attached' });
+    await page.screenshot({ path: path.join(process.env.PROOFLOOP_SCREENSHOT_DIRECTORY, 'discovery-mobile.png'), fullPage: true, animations: 'disabled' });
+    await page.setViewportSize({ width: 1440, height: 1000 });
+    await page.screenshot({ path: path.join(process.env.PROOFLOOP_SCREENSHOT_DIRECTORY, 'discovery-desktop.png'), fullPage: true, animations: 'disabled' });
+  }
   assert.deepEqual(errors, []);
   assert(!requestedPaths.includes('/api/state'));
 });

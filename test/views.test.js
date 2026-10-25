@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   renderAssist,
+  renderActivity,
   renderCounts,
   renderCvText,
   renderDraft,
@@ -43,8 +44,12 @@ function application(overrides = {}) {
     recruiter_message: 'I would like to discuss your backend engineering role.',
     cover_letter: 'My experience building and maintaining services fits this role. '.repeat(3),
     pdf_path: '/unused/application-11.pdf',
+    ats_check: '',
     status: 'draft',
     submitted_at: null,
+    outcome: null,
+    outcome_at: null,
+    outcome_detail: null,
     ...overrides,
   };
 }
@@ -64,6 +69,11 @@ function state(overrides = {}) {
     },
     jobs: [job()],
     applications: [],
+    metrics: {
+      companiesApplied: 0, submitted: 0, approved: 0, drafts: 0,
+      interviews: 0, offers: 0, hired: 0, closed: 0, awaitingOutcome: 0, followUpDue: 0,
+    },
+    activity: { events: [], nextBefore: null },
     sources: [{ id: 21, slug: 'acme', type: 'greenhouse', active: 1 }],
     ...overrides,
   };
@@ -74,6 +84,13 @@ function tagWith(html, tagName, attribute, value) {
   const tag = tags.find((item) => item.includes(` ${attribute}="${value}"`));
   assert.ok(tag, `Expected ${tagName} with ${attribute}="${value}"`);
   return tag;
+}
+
+function articleWith(html, id) {
+  const marker = `id="application-${id}"`;
+  const start = html.indexOf(marker);
+  assert.ok(start >= 0, `Expected application-${id}`);
+  return html.slice(html.lastIndexOf('<article', start), html.indexOf('</article>', start) + 10);
 }
 
 function attributes(tag, expected) {
@@ -155,6 +172,25 @@ test('jobs shell wires scanning and debounced filters to HTMX fragments', () => 
   attributes(tagWith(html, 'select', 'id', 'job-filter'), { name: 'filter' });
   attributes(tagWith(html, 'input', 'id', 'match-only'), { name: 'matchOnly', type: 'checkbox', value: 'on' });
   for (const value of ['new', 'all', 'skipped']) tagWith(html, 'option', 'value', value);
+});
+
+test('JobSpy search uses bounded controls and escapes query values and partial provider failures', () => {
+  const html = renderView('jobs', state({
+    search: { site: 'linkedin', searchTerm: hostile, location: hostile, country: 'india', resultsWanted: 25, hoursOld: 168 },
+    searchResult: { source: 'jobspy:linkedin', count: 2, skipped: 1, errors: [hostile], warnings: [hostile] },
+  }));
+  assertInert(html);
+  attributes(tagWith(html, 'form', 'id', 'jobspy-search'), { 'hx-post': '/api/search', 'hx-target': '#dashboard' });
+  attributes(tagWith(html, 'input', 'name', 'resultsWanted'), { min: '1', max: '25' });
+  attributes(tagWith(html, 'input', 'name', 'hoursOld'), { min: '1', max: '720' });
+  assert.match(html, /2 usable openings returned/);
+  assert.match(html, /1 invalid records skipped/);
+  assert.match(html, /Results may be incomplete/);
+  const empty = renderView('jobs', state({ searchResult: { source: 'jobspy:indeed', count: 0, skipped: 0, errors: [], warnings: [] } }));
+  assert.match(empty, /No openings returned/);
+  const missingDescription = job({ description: '' });
+  assert.match(tagWith(renderJobs(state({ jobs: [missingDescription] })), 'button', 'data-action', 'prepare'), /disabled/);
+  assert.doesNotMatch(renderJob(missingDescription), /data-action="prepare"/);
 });
 
 test('jobs combine trimmed case-insensitive title/company search, status and inclusive threshold', () => {
@@ -487,6 +523,147 @@ test('scan results toggle visibility, include zero counts and escape source/coun
   assert.ok(html.includes(`<strong>Failed board</strong>: ${escapedHostile}</p>`));
   assert.match(html, /<strong>Successful board<\/strong>: 4 openings found/);
   assert.doesNotMatch(html, /999 openings found/);
+});
+
+test('tracker separates company totals from submissions and displays confirmed timestamps', () => {
+  const html = renderView('applications', state({
+    metrics: {
+      companiesApplied: 2, submitted: 3, approved: 4, drafts: 5,
+      interviews: 2, offers: 1, hired: 0, closed: 1, awaitingOutcome: 1, followUpDue: 1,
+    },
+    applications: [application({ status: 'submitted', submitted_at: '2026-10-26T10:00:00.000Z' })],
+  }));
+  for (const [id, value] of [
+    ['companies-applied', 2], ['submitted-total', 3], ['approved-total', 4], ['drafts-total', 5],
+    ['funnel-applied', 3], ['funnel-interviews', 2], ['funnel-offers', 1], ['funnel-hired', 0],
+  ]) {
+    assert.ok(html.includes(`id="${id}">${value}</strong>`), id);
+  }
+  assert.match(html, /Only submissions you confirm count as applied/);
+  assert.match(html, /1 awaiting an outcome · 1 ready for a follow-up \(10\+ days quiet\) · 1 closed/);
+  assert.match(html, /ProofLoop does not contact employers, send follow-ups or detect replies/);
+  assert.match(html, /Confirmed <time datetime="2026-10-26T10:00:00.000Z"/);
+});
+
+test('activity escapes external metadata and loads older events with a stable cursor', () => {
+  const html = renderActivity({ events: [{
+    id: 8, application_id: 11, kind: 'submitted', company: hostile, title: hostile,
+    detail: hostile, occurred_at: '2026-10-26T10:00:00.000Z',
+  }], nextBefore: 8 });
+  assertInert(html);
+  assert.match(html, /Submission confirmed by you/);
+  attributes(tagWith(html, 'button', 'hx-get', '/api/activity?before=8'), { 'hx-target': 'this', 'hx-swap': 'outerHTML' });
+  assert.match(renderActivity({ events: [], nextBefore: null }), /No application activity yet/);
+});
+
+test('submitted applications record outcomes locally and remind when ten days are quiet', () => {
+  const html = renderView('applications', state({
+    applications: [
+      application({
+        id: 21, status: 'submitted', submitted_at: '2026-01-01T00:00:00.000Z',
+        outcome: 'interview', outcome_at: '2026-01-12T09:30:00.000Z', outcome_detail: 'Recruiter call',
+      }),
+      application({ id: 22, status: 'submitted', submitted_at: '2020-01-01T00:00:00.000Z' }),
+      application({ id: 23, status: 'approved' }),
+    ],
+  }));
+  const interview = articleWith(html, 21);
+  assert.match(interview, /class="outcome-badge interview">Interview</);
+  assert.match(interview, /Recruiter call/);
+  assert.match(interview, /Recorded <time datetime="2026-01-12T09:30:00.000Z"/);
+  const form = tagWith(interview, 'form', 'class', 'outcome-form');
+  attributes(form, {
+    'hx-post': '/api/applications/21/outcome', 'hx-target': '#dashboard',
+    'hx-swap': 'innerHTML', 'hx-sync': 'this:drop',
+  });
+  const select = tagWith(interview, 'select', 'name', 'outcome');
+  assert.match(select, /\srequired(?:\s|>)/);
+  for (const stage of ['interview', 'offer', 'rejected', 'hired', 'withdrawn', 'no_response']) {
+    tagWith(interview, 'option', 'value', stage);
+  }
+  attributes(tagWith(interview, 'input', 'name', 'detail'), { maxlength: '500' });
+  assert.match(interview, /Saved locally\. Recording an outcome does not contact the employer/);
+
+  const quiet = articleWith(html, 22);
+  assert.match(quiet, /Awaiting outcome/);
+  assert.match(quiet, /No outcome recorded \d+ days after submission\. Follow up with the employer yourself\./);
+  assert.doesNotMatch(quiet, /outcome-badge/);
+
+  const approved = articleWith(html, 23);
+  assert.doesNotMatch(approved, /outcome-form|outcome-badge|Awaiting outcome/);
+  assert.match(approved, /data-action="assist"/);
+});
+
+test('outcome notes, labels and ATS details cannot inject markup', () => {
+  const ats = JSON.stringify({
+    status: 'fail', pages: hostile, characters: hostile,
+    checks: [{ label: hostile, status: 'fail', detail: hostile }],
+  });
+  const draft = renderDraft(application({ ats_check: ats }));
+  assertInert(draft);
+  assert.ok(draft.includes(`<strong>${escapedHostile}</strong><span>${escapedHostile}</span>`));
+  const tracker = renderView('applications', state({
+    applications: [application({
+      id: hostile, title: hostile, company: hostile, location: hostile,
+      status: 'submitted', submitted_at: '2026-01-01T00:00:00.000Z',
+      outcome: 'interview', outcome_at: '2026-01-12T09:30:00.000Z',
+      outcome_detail: hostile, ats_check: ats,
+    })],
+  }));
+  assertInert(tracker);
+  const encodedId = encodeURIComponent(hostile).replaceAll("'", '&#39;');
+  tagWith(tracker, 'article', 'id', `application-${escapedHostile}`);
+  attributes(tagWith(tracker, 'form', 'class', 'outcome-form'), { 'hx-post': `/api/applications/${encodedId}/outcome` });
+  tagWith(tracker, 'select', 'name', 'outcome');
+  assert.ok(tracker.includes(`<p class="outcome-detail">${escapedHostile}</p>`));
+});
+
+test('draft renders stored ATS checks and treats missing or malformed records as pending', () => {
+  const check = {
+    status: 'warn', pages: 2, characters: 1234,
+    checks: [
+      { label: 'Selectable text', status: 'pass', detail: '1234 characters across 2 pages.' },
+      { label: 'Email', status: 'fail', detail: 'Profile email was not found as selectable text.' },
+    ],
+  };
+  const html = renderDraft(application({ ats_check: JSON.stringify(check) }));
+  assert.match(html, /class="ats-panel ats-warn"/);
+  assert.match(html, /class="ats-status ats-warn">Warnings</);
+  assert.match(html, /1234 characters across 2 page\(s\)\. Mechanical check only; not an ATS guarantee\./);
+  assert.match(html, /<li class="ats-pass"><strong>Selectable text<\/strong><span>1234 characters across 2 pages\.<\/span><\/li>/);
+  assert.match(html, /<li class="ats-fail"><strong>Email<\/strong><span>Profile email was not found as selectable text\.<\/span><\/li>/);
+  for (const stored of ['', 'not json', JSON.stringify({ status: 'odd', checks: [] }), JSON.stringify(null)]) {
+    const pending = renderDraft(application({ ats_check: stored }));
+    assert.match(pending, /ATS parse check/);
+    assert.match(pending, /Not run/);
+    assert.match(pending, /Save edits or approve to run a mechanical text-layer check on this PDF/);
+  }
+  const tracker = renderView('applications', state({
+    applications: [application({ status: 'approved', ats_check: JSON.stringify(check) })],
+  }));
+  assert.match(tracker, /class="ats-chip ats-warn">ATS: Warnings<\/span>/);
+  const failed = renderDraft(application({
+    ats_check: JSON.stringify({ ...check, status: 'fail', checks: [check.checks[1]] }),
+  }));
+  assert.match(failed, /class="ats-panel ats-fail"/);
+  assert.match(failed, /class="ats-status ats-fail">Needs attention</);
+});
+
+test('activity labels recorded outcomes without inventing a reply', () => {
+  for (const [kind, label] of [
+    ['outcome_interview', 'Interview recorded'],
+    ['outcome_offer', 'Offer recorded'],
+    ['outcome_rejected', 'Rejection recorded'],
+    ['outcome_hired', 'Hire recorded'],
+    ['outcome_withdrawn', 'Withdrawal recorded'],
+    ['outcome_no_response', 'No response recorded'],
+  ]) {
+    const html = renderActivity({ events: [{
+      id: 1, application_id: 11, kind, company: 'Acme', title: 'Engineer',
+      detail: 'User note', occurred_at: '2026-10-26T10:00:00.000Z',
+    }], nextBefore: null });
+    assert.match(html, new RegExp(`<strong>${label}</strong>`));
+  }
 });
 
 test('assisted apply pauses explain the required manual action without claiming success', () => {

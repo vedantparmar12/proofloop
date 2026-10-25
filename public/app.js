@@ -34,6 +34,7 @@ document.body.addEventListener('htmx:afterRequest', (event) => {
   if (element.id === 'source-form') element.reset();
   if (element.id === 'profile-form') delete element.dataset.dirty;
   if (element.matches('form.review-card')) toast('Edits saved');
+  if (element.matches('form.outcome-form')) toast('Outcome saved locally');
 });
 
 document.body.addEventListener('htmx:afterSwap', (event) => {
