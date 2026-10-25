@@ -98,6 +98,89 @@ export async function createCvPdf(markdown, filename) {
   return output;
 }
 
+export async function inspectCvPdf(file, profile) {
+  let pages = 0;
+  let characters = 0;
+  let text = '';
+  let readError = '';
+
+  try {
+    const bytes = await readFile(file);
+    if (bytes.subarray(0, 4).toString() !== '%PDF') throw new Error('Invalid PDF file');
+    const document = await pdfjs.getDocument({ data: new Uint8Array(bytes), disableWorker: true }).promise;
+    pages = document.numPages;
+    const parts = [];
+    for (let pageNumber = 1; pageNumber <= pages; pageNumber += 1) {
+      const page = await document.getPage(pageNumber);
+      const content = await page.getTextContent();
+      parts.push(content.items.map((item) => item.str).join(' '));
+    }
+    text = parts.join('\n\n').trim();
+    characters = text.length;
+  } catch {
+    readError = 'The generated PDF could not be read as text.';
+  }
+
+  const checks = [];
+  checks.push(readError
+    ? { label: 'Selectable text', status: 'fail', detail: readError }
+    : {
+        label: 'Selectable text',
+        status: characters >= 80 ? 'pass' : 'fail',
+        detail: characters >= 80
+          ? `${characters} characters across ${pages} page${pages === 1 ? '' : 's'}.`
+          : 'Too little selectable text was found.',
+      });
+
+  if (!readError && characters >= 80) {
+    checks.push({
+      label: 'Clean text layer',
+      status: text.includes('\uFFFD') || /\(cid:\d+\)/.test(text) ? 'fail' : 'pass',
+      detail: text.includes('\uFFFD') || /\(cid:\d+\)/.test(text)
+        ? 'Some characters are garbled in the text layer.'
+        : 'No replacement glyphs or CID placeholders.',
+    });
+
+    const searchable = text.toLowerCase().replace(/\s+/g, ' ');
+    const name = profile.name.trim().replace(/\s+/g, ' ');
+    checks.push(name
+      ? {
+          label: 'Name',
+          status: searchable.includes(name.toLowerCase()) ? 'pass' : 'warn',
+          detail: searchable.includes(name.toLowerCase())
+            ? 'Profile name is present as text.'
+            : 'Profile name was not found as selectable text.',
+        }
+      : { label: 'Name', status: 'warn', detail: 'Add a name to the profile to check it.' });
+
+    const email = profile.email.trim();
+    checks.push(email
+      ? {
+          label: 'Email',
+          status: searchable.includes(email.toLowerCase()) ? 'pass' : 'fail',
+          detail: searchable.includes(email.toLowerCase())
+            ? 'Profile email is present as text.'
+            : 'Profile email was not found as selectable text.',
+        }
+      : { label: 'Email', status: 'warn', detail: 'Add an email to the profile to check it.' });
+
+    const phoneDigits = profile.phone.replace(/\D/g, '');
+    if (phoneDigits) {
+      checks.push({
+        label: 'Phone',
+        status: searchable.replace(/\D/g, '').includes(phoneDigits) ? 'pass' : 'warn',
+        detail: searchable.replace(/\D/g, '').includes(phoneDigits)
+          ? 'Profile phone digits are present as text.'
+          : 'Profile phone digits were not found; the template may omit the phone number.',
+      });
+    }
+  }
+
+  const status = checks.some((check) => check.status === 'fail') ? 'fail'
+    : checks.some((check) => check.status === 'warn') ? 'warn' : 'pass';
+  return { status, pages, characters, checks };
+}
+
 function wrapText(text, font, size, maxWidth) {
   if (!text) return [];
   const words = text.split(/\s+/);

@@ -13,9 +13,13 @@ import {
   getApplicationForJob,
   getJob,
   getProfile,
+  getApplicationMetrics,
   listApplications,
+  listApplicationEvents,
   listJobs,
   listSources,
+  recordApplicationEvent,
+  recordOutcome,
   removeSource,
   setApplicationStatus,
   setJobStatus,
@@ -24,11 +28,13 @@ import {
   upsertJob,
 } from './db.js';
 import { scanSource } from './connectors.js';
+import { jobspySearchSchema, searchJobspy } from './jobspy.js';
 import { rankJob } from './matcher.js';
 import { createDraft } from './gemini.js';
-import { createCvPdf, extractCvText } from './documents.js';
+import { createCvPdf, extractCvText, inspectCvPdf } from './documents.js';
 import { assistApplication } from './assistedApply.js';
-import { renderView, renderJobs, renderSources, renderDraft, renderJob, renderCvText, renderAssist, renderCounts } from './views.js';
+import { OUTCOME_STAGES } from './outcomes.js';
+import { renderView, renderJobs, renderSources, renderDraft, renderJob, renderCvText, renderAssist, renderCounts, renderActivity } from './views.js';
 
 const require = createRequire(import.meta.url);
 const port = Number(process.env.PORT || 3000);
@@ -54,6 +60,10 @@ const draftSchema = z.object({
   recruiterMessage: z.string().trim().min(20).max(4000),
   coverLetter: z.string().trim().min(100).max(12000),
 });
+const outcomeSchema = z.object({
+  outcome: z.enum(OUTCOME_STAGES),
+  detail: z.string().trim().max(500).default(''),
+}).strict();
 
 app.disable('x-powered-by');
 app.use((request, response, next) => {
@@ -101,6 +111,12 @@ app.get('/views/:view', (request, response) => {
 
 app.get('/api/health', (_request, response) => response.json({ ok: true }));
 app.get('/api/state', (_request, response) => response.json(dashboardState()));
+app.get('/api/activity', (request, response) => {
+  const before = request.query.before === undefined ? null : z.coerce.number().int().positive().safe().parse(request.query.before);
+  const activity = listApplicationEvents(before);
+  if (isHtmx(request)) return response.type('html').send(renderActivity(activity));
+  response.json(activity);
+});
 
 app.put('/api/profile', (request, response) => {
   const input = isHtmx(request) ? { ...request.body, minMatch: Number(request.body?.minMatch) } : request.body;
@@ -153,17 +169,32 @@ app.post('/api/scan', async (request, response) => {
   response.json({ results });
 });
 
+app.post('/api/search', async (request, response) => {
+  const search = jobspySearchSchema.parse(request.body);
+  const result = await searchJobspy(search);
+  const profile = getProfile();
+  for (const job of result.jobs) upsertJob(job, rankJob(profile, job));
+  const report = {
+    source: `jobspy:${search.site}`, count: result.jobs.length, skipped: result.skipped,
+    errors: Object.values(result.errors), warnings: Object.values(result.warnings).flat(),
+  };
+  if (isHtmx(request)) return sendView(response, 'jobs', { ...dashboardState(), searchResult: report, search });
+  response.json(report);
+});
+
 app.post('/api/jobs/:id/prepare', async (request, response) => {
   const jobId = idParameter(request.params.id);
   const job = getJob(jobId);
   if (!job) return response.status(404).json({ error: 'Job not found' });
+  if (!job.description.trim()) return response.status(400).json({ error: 'This posting has no job description. Review the original posting manually; a draft cannot be prepared.' });
   const profile = getProfile();
   if (profile.cv_text.length < 50) return response.status(400).json({ error: 'Add your CV in Profile before preparing a draft' });
   const existing = getApplicationForJob(jobId);
   if (existing) return response.status(409).json({ error: `This job already has a ${existing.status} application`, applicationId: existing.id });
   const draft = await createDraft(profile, job);
   const pdfPath = await createCvPdf(draft.tailoredCv, `${randomUUID()}.pdf`);
-  const application = createApplication(jobId, draft, path.basename(pdfPath));
+  const atsCheck = await inspectCvPdf(pdfPath, profile);
+  const application = createApplication(jobId, draft, path.basename(pdfPath), atsCheck);
   if (isHtmx(request)) return sendView(response.status(201), 'review');
   response.status(201).json(application);
 });
@@ -197,7 +228,8 @@ app.put('/api/applications/:id', async (request, response) => {
   if (application.status !== 'draft') return response.status(409).json({ error: 'Only draft applications can be edited' });
   const draft = draftSchema.parse(request.body);
   const pdfPath = await createCvPdf(draft.tailoredCv, application.pdf_path);
-  const updated = updateDraft(id, draft, path.basename(pdfPath));
+  const atsCheck = await inspectCvPdf(pdfPath, getProfile());
+  const updated = updateDraft(id, draft, path.basename(pdfPath), atsCheck);
   if (isHtmx(request)) return response.type('html').send(renderDraft(updated));
   response.json(updated);
 });
@@ -210,7 +242,8 @@ app.post('/api/applications/:id/approve', async (request, response) => {
   if (isHtmx(request)) {
     const draft = draftSchema.parse(request.body);
     const pdfPath = await createCvPdf(draft.tailoredCv, application.pdf_path);
-    updateDraft(id, draft, path.basename(pdfPath));
+    const atsCheck = await inspectCvPdf(pdfPath, getProfile());
+    updateDraft(id, draft, path.basename(pdfPath), atsCheck);
   }
   const approved = setApplicationStatus(id, 'approved');
   if (isHtmx(request)) return sendView(response, 'applications');
@@ -222,8 +255,17 @@ app.post('/api/applications/:id/assist', async (request, response) => {
   const application = getApplication(id);
   if (!application) return response.status(404).json({ error: 'Application not found' });
   if (application.status !== 'approved') return response.status(409).json({ error: 'Approve the application before using assisted apply' });
-  const result = await assistApplication(application, getProfile(), path.join(dataDirectory, path.basename(application.pdf_path)));
-  if (isHtmx(request)) return response.type('html').send(renderAssist(result));
+  let result;
+  try {
+    result = await assistApplication(application, getProfile(), path.join(dataDirectory, path.basename(application.pdf_path)));
+  } catch (error) {
+    recordApplicationEvent(id, 'assist_failed', 'Browser assistance failed. No submission was recorded.');
+    throw error;
+  }
+  recordApplicationEvent(id, result.paused ? 'assist_paused' : 'assist_opened', result.paused
+    ? `Paused: ${result.paused}. No submission was recorded.`
+    : `${result.filledFields} fields filled; ${result.cvAttached ? 'CV attached' : 'no new attachment'}. Submission remains manual.`);
+  if (isHtmx(request)) return response.type('html').send(renderAssist(result) + `<div id="activity-list" hx-swap-oob="innerHTML">${renderActivity(listApplicationEvents())}</div>`);
   response.json(result);
 });
 
@@ -235,6 +277,17 @@ app.post('/api/applications/:id/submit', (request, response) => {
   const submitted = setApplicationStatus(id, 'submitted');
   if (isHtmx(request)) return sendView(response, 'applications');
   response.json(submitted);
+});
+
+app.post('/api/applications/:id/outcome', (request, response) => {
+  const id = idParameter(request.params.id);
+  const application = getApplication(id);
+  if (!application) return response.status(404).json({ error: 'Application not found' });
+  if (application.status !== 'submitted') return response.status(409).json({ error: 'Confirm submission before recording an outcome' });
+  const { outcome, detail } = outcomeSchema.parse(request.body);
+  const event = recordOutcome(id, outcome, detail);
+  if (isHtmx(request)) return sendView(response.status(201), 'applications');
+  response.status(201).json(event);
 });
 
 app.get('/api/applications/:id/pdf', async (request, response) => {
@@ -256,7 +309,7 @@ app.use((error, _request, response, _next) => {
     return response.status(400).json({ error: error.code === 'LIMIT_FILE_SIZE' ? 'CV files must be 8 MB or smaller' : error.message });
   }
   console.error(error);
-  response.status(500).json({ error: error.message || 'Unexpected server error' });
+  response.status(error.status === 429 ? 429 : 500).json({ error: error.message || 'Unexpected server error' });
 });
 
 const server = app.listen(port, '127.0.0.1', () => {
@@ -264,7 +317,10 @@ const server = app.listen(port, '127.0.0.1', () => {
 });
 
 function dashboardState() {
-  return { profile: getProfile(), sources: listSources(), jobs: listJobs(), applications: listApplications() };
+  return {
+    profile: getProfile(), sources: listSources(), jobs: listJobs(), applications: listApplications(),
+    metrics: getApplicationMetrics(), activity: listApplicationEvents(),
+  };
 }
 
 function isHtmx(request) {
